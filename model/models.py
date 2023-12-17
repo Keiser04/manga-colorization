@@ -290,9 +290,6 @@ class Generator(nn.Module):
         
         out = self.tunnel4(torch.cat([x4, sketch_feat], 1))
         
-        
-        
-        
         x = self.tunnel3(torch.cat([out, x3], 1))
         x = self.tunnel2(torch.cat([x, x2], 1))
         x = self.tunnel1(torch.cat([x, x1], 1))
@@ -349,7 +346,7 @@ class Colorizer(nn.Module):
         self.extractor.eval()
             
     def extractor_train(self):
-        for param in extractor.parameters():
+        for param in self.extractor.parameters(): #agrege el self aqui
             param.requires_grad = True
         self.extractor.train()
             

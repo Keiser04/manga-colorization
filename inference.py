@@ -1,215 +1,306 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import numpy as np
-from utils.dataset_utils import get_sketch
-from utils.utils import resize_pad, generate_mask, extract_cbr, create_cbz, sorted_alphanumeric, subfolder_image_search, remove_folder
-from torchvision.transforms import ToTensor
-import os
-import matplotlib.pyplot as plt
+import albumentations as albu
 import argparse
-from model.models import Colorizer, Generator
+import datetime
+
+from utils.utils import open_json, weights_init, weights_init_spectr, generate_mask
+from model.models import Colorizer, Generator, Content, Discriminator
 from model.extractor import get_seresnext_extractor
-from utils.xdog import XDoGSketcher
-from utils.utils import open_json
-import sys
-from denoising.denoiser import FFDNetDenoiser
-
-def colorize_without_hint(inp, color_args):
-    i_hint = torch.zeros(1, 4, inp.shape[2], inp.shape[3]).float().to(color_args['device'])
-    
-    with torch.no_grad():
-        fake_color, _ = color_args['colorizer'](torch.cat([inp, i_hint], 1))
-    
-    if color_args['auto_hint']:
-        mask = generate_mask(fake_color.shape[2], fake_color.shape[3], full = False, prob = 1, sigma = color_args['auto_hint_sigma']).unsqueeze(0)
-        mask = mask.to(color_args['device'])
-        
-        
-        if color_args['ignore_gray']:
-            diff1 = torch.abs(fake_color[:, 0] - fake_color[:, 1])
-            diff2 = torch.abs(fake_color[:, 0] - fake_color[:, 2])
-            diff3 = torch.abs(fake_color[:, 1] - fake_color[:, 2])
-            mask = ((mask + ((diff1 + diff2 + diff3) > 60 / 255).float().unsqueeze(1)) == 2).float()
-        
-        
-        i_hint = torch.cat([fake_color * mask, mask], 1)
-        
-        with torch.no_grad():
-            fake_color, _ = color_args['colorizer'](torch.cat([inp, i_hint], 1))
-        
-    return fake_color
+from dataset.datasets import TrainDataset, FineTuningDataset
 
 
-def process_image(image, color_args, to_tensor = ToTensor()):
-    image, pad = resize_pad(image)
-    
-    if color_args['denoiser'] is not None:
-        image = color_args['denoiser'].get_denoised_image(image, color_args['denoiser_sigma'])
-    
-    bw, dfm = get_sketch(image, color_args['sketcher'], color_args['dfm'])
-    
-    bw = to_tensor(bw).unsqueeze(0).to(color_args['device'])
-    dfm = to_tensor(dfm).unsqueeze(0).to(color_args['device'])
-    
-    output = colorize_without_hint(torch.cat([bw, dfm], 1), color_args)
-    result = output[0].cpu().permute(1, 2, 0).numpy() * 0.5 + 0.5
-    
-    if pad[0] != 0:
-        result = result[:-pad[0]]
-    if pad[1] != 0:
-        result = result[:, :-pad[1]]
-        
-    return result
 
-def colorize_with_hint(inp, color_args):
-    with torch.no_grad():
-        fake_color, _ = color_args['colorizer'](inp)
-        
-    return fake_color
-    
-def process_image_with_hint(bw, dfm, hint, color_args, to_tensor = ToTensor()):
-    bw = to_tensor(bw).unsqueeze(0).to(color_args['device'])
-    dfm = to_tensor(dfm).unsqueeze(0).to(color_args['device'])
-    
-    i_hint = (torch.FloatTensor(hint[..., :3]).permute(2, 0, 1) - 0.5) / 0.5
-    mask = torch.FloatTensor(hint[..., 3:]).permute(2, 0, 1)
-    i_hint = torch.cat([i_hint * mask, mask], 0).unsqueeze(0).to(color_args['device'])
-    
-    output = colorize_with_hint(torch.cat([bw, dfm, i_hint], 1), color_args)
-    result = output[0].cpu().permute(1, 2, 0).numpy() * 0.5 + 0.5
-    
-    return result
-    
-def colorize_single_image(file_path, save_path, color_args):
-    try:
-        image = plt.imread(file_path)
-
-        colorization = process_image(image, color_args)
-
-        plt.imsave(save_path, colorization)
-        
-        return True
-    except KeyboardInterrupt:
-        sys.exit(0)
-    except:
-        print('Failed to colorize {}'.format(file_path))
-        return False
-
-def colorize_images(source_path, target_path, color_args):
-    images = os.listdir(source_path)
-    
-    for image_name in images:
-        file_path = os.path.join(source_path, image_name)
-        
-        name, ext = os.path.splitext(image_name)
-        if (ext != '.png'):
-            image_name = name + '.png'
-        
-        save_path = os.path.join(target_path, image_name)
-        colorize_single_image(file_path, save_path, color_args)
-            
-def colorize_cbr(file_path, color_args):
-    file_name = os.path.splitext(os.path.basename(file_path))[0]
-    temp_path = 'temp_colorization'
-    
-    if not  os.path.exists(temp_path):
-        os.makedirs(temp_path)
-    extract_cbr(file_path, temp_path)
-    
-    images = subfolder_image_search(temp_path)
-    
-    result_images = []
-    for image_path in images:
-        save_path = image_path
-        
-        path, ext = os.path.splitext(save_path)
-        if (ext != '.png'):
-            save_path = path + '.png'
-        
-        res_flag = colorize_single_image(image_path, save_path, color_args)
-        
-        result_images.append(save_path if res_flag else image_path)
-        
-    
-    result_name = os.path.join(os.path.dirname(file_path), file_name + '_colorized.cbz')
-    
-    create_cbz(result_name, result_images)
-    
-    remove_folder(temp_path)
-    
-    return result_name
-    
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-p", "--path", required=True)
-    parser.add_argument("-gen", "--generator", default = 'model/generator.pth')
-    parser.add_argument("-ext", "--extractor", default = 'model/extractor.pth')
-    parser.add_argument("-s", "--sigma", type = float, default = 0.003)
+    parser.add_argument("-p", "--path", required=True, help = "dataset path")
+    parser.add_argument('-ft', '--fine_tuning', dest = 'fine_tuning', action = 'store_true')
     parser.add_argument('-g', '--gpu', dest = 'gpu', action = 'store_true')
-    parser.add_argument('-ah', '--auto', dest = 'autohint', action = 'store_true')
-    parser.add_argument('-ig', '--ignore_grey', dest = 'ignore', action = 'store_true')
-    parser.add_argument('-nd', '--no_denoise', dest = 'denoiser', action = 'store_false')
-    parser.add_argument("-ds", "--denoiser_sigma", type = int, default = 25)
+    parser.set_defaults(fine_tuning = False)
     parser.set_defaults(gpu = False)
-    parser.set_defaults(autohint = False)
-    parser.set_defaults(ignore = False)
-    parser.set_defaults(denoiser = True)
     args = parser.parse_args()
     
     return args
 
+def get_transforms():
+    return albu.Compose([albu.RandomCrop(512, 512, always_apply = True), albu.HorizontalFlip(p = 0.5)], p = 1.)
+
+def get_dataloaders(data_path, transforms, batch_size, fine_tuning, mult_number):
+    train_dataset = TrainDataset(data_path, transforms, mult_number)
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size = batch_size, shuffle = True)
     
-if __name__ == "__main__":
+    if fine_tuning:
+        finetuning_dataset = FineTuningDataset(data_path, transforms)
+        finetuning_dataloader = torch.utils.data.DataLoader(finetuning_dataset, batch_size = batch_size, shuffle = True)
     
+    return train_dataloader, finetuning_dataloader
+
+def get_models(device):
+    generator = Generator()
+    extractor = get_seresnext_extractor()
+    colorizer = Colorizer(generator, extractor)
+    
+    colorizer.extractor_eval()
+    colorizer = colorizer.to(device)
+    
+    discriminator = Discriminator().to(device)
+    
+    content = Content('model/vgg16-397923af.pth').eval().to(device)
+    for param in content.parameters():
+        param.requires_grad = False
+    
+    return colorizer, discriminator, content
+
+def set_weights(colorizer, discriminator):
+    colorizer.generator.apply(weights_init)
+    colorizer.load_extractor_weights(torch.load('model/extractor.pth'))
+    
+    discriminator.apply(weights_init_spectr)
+    
+def generator_loss(disc_output, true_labels, main_output, guide_output, real_image, content_gen, content_true, dist_loss = nn.L1Loss(), content_dist_loss = nn.MSELoss(), class_loss = nn.BCEWithLogitsLoss()):    
+    sim_loss_full = dist_loss(main_output, real_image)
+    sim_loss_guide = dist_loss(guide_output, real_image)
+    
+    adv_loss = class_loss(disc_output, true_labels)
+    
+    content_loss = content_dist_loss(content_gen, content_true)
+    
+    sum_loss = 10 * (sim_loss_full + 0.9 * sim_loss_guide)  + adv_loss + content_loss
+    
+    return sum_loss
+    
+def get_optimizers(colorizer, discriminator, generator_lr, discriminator_lr):
+    optimizerG = optim.Adam(colorizer.generator.parameters(), lr = generator_lr, betas=(0.5, 0.9))
+    optimizerD = optim.Adam(discriminator.parameters(), lr = discriminator_lr, betas=(0.5, 0.9))
+    
+    return optimizerG, optimizerD
+
+def generator_step(inputs, colorizer, discriminator, content,  loss_function, optimizer, device, white_penalty = True):
+    for p in discriminator.parameters():
+        p.requires_grad = False  
+    for p in colorizer.generator.parameters():
+        p.requires_grad = True    
+
+    colorizer.generator.zero_grad()
+
+    bw, color, hint, dfm = inputs  
+    bw, color, hint, dfm = bw.to(device), color.to(device), hint.to(device), dfm.to(device)
+
+    fake, guide = colorizer(torch.cat([bw, dfm, hint], 1))
+
+    logits_fake = discriminator(fake)
+    y_real = torch.ones((bw.size(0), 1), device = device)
+
+    content_fake = content(fake)
+    with torch.no_grad():
+        content_true = content(color)
+
+    generator_loss = loss_function(logits_fake, y_real, fake, guide, color, content_fake, content_true)
+    
+    if white_penalty:
+        mask = (~((color > 0.85).float().sum(dim = 1) == 3).unsqueeze(1).repeat((1, 3, 1, 1 ))).float()
+        white_zones = mask * (fake + 1) / 2
+        white_penalty = (torch.pow(white_zones.sum(dim = 1), 2).sum(dim = (1, 2)) / (mask.sum(dim = (1, 2, 3)) + 1)).mean()
+        
+        generator_loss += white_penalty
+
+    generator_loss.backward()
+
+    optimizer.step()
+    
+    return generator_loss.item()
+
+def discriminator_step(inputs, colorizer, discriminator, optimizer, device, loss_function = nn.BCEWithLogitsLoss()):
+    
+    for p in discriminator.parameters():
+        p.requires_grad = True 
+    for p in colorizer.generator.parameters():
+        p.requires_grad = False
+
+    discriminator.zero_grad()
+
+    bw, color, hint, dfm = inputs  
+    bw, color, hint, dfm = bw.to(device), color.to(device), hint.to(device), dfm.to(device)
+    
+    y_real = torch.full((bw.size(0), 1), 0.9, device = device)
+
+    y_fake = torch.zeros((bw.size(0), 1), device = device)
+
+    with torch.no_grad():
+        fake_color, _ = colorizer(torch.cat([bw, dfm, hint], 1))
+        fake_color.detach()
+
+    logits_fake = discriminator(fake_color)
+    logits_real = discriminator(color)
+
+    fake_loss = loss_function(logits_fake, y_fake)
+    real_loss = loss_function(logits_real, y_real)
+    
+    discriminator_loss = real_loss + fake_loss
+
+    discriminator_loss.backward()
+    optimizer.step()
+    
+    return discriminator_loss.item()
+
+def decrease_lr(optimizer, rate):
+    for group in optimizer.param_groups:
+        group['lr'] /= rate 
+        
+def set_lr(optimizer, value):
+    for group in optimizer.param_groups:
+        group['lr'] = value
+        
+def train(colorizer, discriminator, content, dataloader, epochs, colorizer_optimizer, discriminator_optimizer, lr_decay_epoch = -1, device = 'cpu'):
+    colorizer.generator.train()
+    discriminator.train()
+
+    disc_step  = True
+    
+    for epoch in range(epochs):
+        if (epoch == lr_decay_epoch):
+            decrease_lr(colorizer_optimizer, 10)
+            decrease_lr(discriminator_optimizer, 10)
+            
+        sum_disc_loss = 0
+        sum_gen_loss = 0
+        
+        for n, inputs in enumerate(dataloader):
+            if n % 5 == 0:
+                print(datetime.datetime.now().time())
+                print('Step : %d Discr loss: %.4f Gen loss : %.4f \n'%(n, sum_disc_loss / (n // 2 + 1), sum_gen_loss / (n // 2 + 1)))
+            
+            
+            if disc_step:
+                step_loss = discriminator_step(inputs, colorizer, discriminator, discriminator_optimizer, device)
+                sum_disc_loss += step_loss
+            else:
+                step_loss = generator_step(inputs, colorizer, discriminator, content, generator_loss, colorizer_optimizer, device)
+                sum_gen_loss += step_loss
+                
+            disc_step = disc_step ^ True
+    
+    
+        print(datetime.datetime.now().time())
+        print('Epoch : %d Discr loss: %.4f Gen loss : %.4f \n'%(epoch, sum_disc_loss / (n // 2 + 1), sum_gen_loss / (n // 2 + 1)))
+        
+        
+def fine_tuning_step(data_iter, colorizer, discriminator, gen_optimizer, disc_optimizer, device, loss_function = nn.BCEWithLogitsLoss()):
+    
+    for p in discriminator.parameters():
+        p.requires_grad = True 
+    for p in colorizer.generator.parameters():
+        p.requires_grad = False
+        
+    for cur_disc_step in range(5):
+        discriminator.zero_grad()
+        
+        try:
+            bw, dfm, color_for_real = next(data_iter)
+        except StopIteration:
+            print("No more elements in data_iter.")
+            return
+
+        bw, dfm, color_for_real = bw.to(device), dfm.to(device), color_for_real.to(device)
+        
+        y_real = torch.full((bw.size(0), 1), 0.9, device = device)
+        y_fake = torch.zeros((bw.size(0), 1), device = device)
+
+        empty_hint = torch.zeros(bw.shape[0], 4, bw.shape[2] , bw.shape[3] ).float().to(device)
+        
+        with torch.no_grad():
+            fake_color_manga, _ = colorizer(torch.cat([bw, dfm, empty_hint ], 1))
+            fake_color_manga.detach()
+            
+        logits_fake = discriminator(fake_color_manga)
+        logits_real = discriminator(color_for_real)
+
+        fake_loss = loss_function(logits_fake, y_fake)
+        real_loss = loss_function(logits_real, y_real)
+        discriminator_loss = real_loss + fake_loss
+
+        discriminator_loss.backward()
+        disc_optimizer.step()
+        
+        
+    for p in discriminator.parameters():
+        p.requires_grad = False  
+    for p in colorizer.generator.parameters():
+        p.requires_grad = True
+        
+    colorizer.generator.zero_grad()    
+
+    try:
+        bw, dfm, _ = next(data_iter)
+    except StopIteration:
+        print("No more elements in data_iter.")
+        return
+
+    bw, dfm = bw.to(device), dfm.to(device)
+    
+    y_real = torch.ones((bw.size(0), 1), device = device)
+    
+    empty_hint = torch.zeros(bw.shape[0], 4, bw.shape[2] , bw.shape[3]).float().to(device)
+    
+    fake_manga, _ = colorizer(torch.cat([bw, dfm, empty_hint], 1))
+
+    logits_fake = discriminator(fake_manga)
+    adv_loss = loss_function(logits_fake, y_real)
+    
+    generator_loss = adv_loss
+    
+    generator_loss.backward()
+    gen_optimizer.step()
+
+    
+        
+def fine_tuning(colorizer, discriminator, content, dataloader, iterations, colorizer_optimizer, discriminator_optimizer, data_iter, device = 'cpu'):
+    colorizer.generator.train()
+    discriminator.train()
+    
+    disc_step = True
+    
+    for n, inputs in enumerate(dataloader):
+        
+        if n == iterations:
+            return
+        
+        if disc_step:
+            discriminator_step(inputs, colorizer, discriminator, discriminator_optimizer, device)
+        else:
+            generator_step(inputs, colorizer, discriminator, content, generator_loss, colorizer_optimizer, device)
+
+        disc_step = disc_step ^ True
+        
+        if n % 10 == 5:
+            fine_tuning_step(data_iter, colorizer, discriminator, colorizer_optimizer, discriminator_optimizer, device)
+    
+if __name__ == '__main__':
     args = parse_args()
+    config = open_json('configs/train_config.json')
     
     if args.gpu:
         device = 'cuda'
     else:
         device = 'cpu'
         
-    generator = Generator()
-    generator.load_state_dict(torch.load(args.generator))
+    augmentations = get_transforms()
     
-    extractor = get_seresnext_extractor()
-    extractor.load_state_dict(torch.load(args.extractor))
+    train_dataloader, ft_dataloader = get_dataloaders(args.path, augmentations, config['batch_size'], args.fine_tuning, config['number_of_mults'])
     
-    colorizer = Colorizer(generator, extractor)
-    colorizer = colorizer.eval().to(device)
+    colorizer, discriminator, content = get_models(device)
+    set_weights(colorizer, discriminator)
     
-    sketcher = XDoGSketcher()
-    xdog_config = open_json('configs/xdog_config.json')
-    for key in xdog_config.keys():
-        if key in sketcher.params:
-            sketcher.params[key] = xdog_config[key]
-
-    denoiser = None
-    if args.denoiser:
-        denoiser = FFDNetDenoiser(device, args.denoiser_sigma)
+    gen_optimizer, disc_optimizer = get_optimizers(colorizer, discriminator, config['generator_lr'], config['discriminator_lr'])
     
-    color_args = {'colorizer':colorizer, 'sketcher':sketcher, 'auto_hint':args.autohint, 'auto_hint_sigma':args.sigma,\
-                 'ignore_gray':args.ignore, 'device':device, 'dfm' : True, 'denoiser':denoiser, 'denoiser_sigma' : args.denoiser_sigma}
+    train(colorizer, discriminator, content, train_dataloader, config['epochs'], gen_optimizer, disc_optimizer, config['lr_decrease_epoch'], device)
     
+    if args.fine_tuning:
+        set_lr(gen_optimizer, config["finetuning_generator_lr"])
+        fine_tuning(colorizer, discriminator, content, train_dataloader, config['finetuning_iterations'], gen_optimizer, disc_optimizer, iter(ft_dataloader), device)
     
-    if os.path.isdir(args.path):
-        colorization_path = os.path.join(args.path, 'colorization')
-        if not os.path.exists(colorization_path):
-            os.makedirs(colorization_path)
-            
-        colorize_images(args.path, colorization_path, color_args)
-        
-    elif os.path.isfile(args.path):
-        
-        split = os.path.splitext(args.path)
-        
-        if split[1].lower() in ('.cbr', '.cbz', '.rar', '.zip'):
-            colorize_cbr(args.path, color_args)
-        elif split[1].lower() in ('.jpg', '.png', ',jpeg'):
-            new_image_path = split[0] + '_colorized' + '.png'
-            
-            colorize_single_image(args.path, new_image_path, color_args)
-        else:
-            print('Wrong format')
-    else:
-        print('Wrong path')
-    
+    now = datetime.datetime.now()
+    formatted_time = now.strftime("%H_%M_%S")
+    torch.save(colorizer.generator.state_dict(), formatted_time + '.pth')
